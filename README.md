@@ -244,3 +244,101 @@ docker compose down
    separate consumer group manually if you want to compare its independent
    starting position.
 
+## Lab 02 — Keys, partitions, and ordering
+
+Lab 02 adds one deliberately small experiment endpoint:
+
+```text
+POST /orders/experiments
+```
+It publishes a sequential batch of `OrderCreated` records and returns the key,
+topic, partition, and offset for every successful send. `orderId` remains the
+Kafka key by default. Set `withoutKey` to `true` only for the controlled
+null-key experiment. This endpoint uses fixed, minimal order data because its
+purpose is observing Kafka partitioning, not order processing.
+
+Run the normal build and start commands from Lab 01, then watch both services:
+
+```bash
+docker compose logs --follow order-service payment-service
+```
+
+### 1. One key: one partition and increasing offsets
+
+Publish 20 records with exactly the same key and payload `orderId`:
+
+```bash
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "orderId": "lab02-same-key",
+    "count": 20,
+    "withoutKey": false
+  }'
+```
+
+The response and order-service logs show the producer metadata. The
+payment-service log should show the same key and partition, with increasing
+offsets for these records.
+
+### 2. Many keys: observe distribution
+
+Publish one record for each of 20 distinct order IDs:
+
+```bash
+for order_number in $(seq 1 20); do
+  curl --silent --show-error --request POST http://localhost:8080/orders/experiments \
+    --header 'Content-Type: application/json' \
+    --data "{\"orderId\":\"lab02-many-${order_number}\",\"count\":1,\"withoutKey\":false}"
+done
+```
+
+Compare the partitions in the responses and logs. With a small sample, records
+need not be distributed evenly across the three partitions.
+
+### 3. Null-key comparison
+
+Publish a separate batch whose Kafka key is `null` while the event payload
+continues to contain an `orderId`:
+
+```bash
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "orderId": "lab02-no-key",
+    "count": 20,
+    "withoutKey": true
+  }'
+```
+
+This is intentionally not the normal order flow. A null key has no
+deterministic key-to-partition mapping; the Kafka producer's partitioner makes
+the selection.
+
+### Inspect the topic and consumer group
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 --describe --topic order.created
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 --describe --group payment-service
+```
+
+In Kafbat UI at <http://localhost:8081>, inspect `order.created` by partition
+rather than treating the topic as one globally ordered stream.
+
+### What to inspect after Lab 02
+
+- Do the 20 `lab02-same-key` records all have the same partition?
+- Are their offsets strictly increasing within that one partition?
+- Do the `lab02-many-*` keys map across the available partitions? Why is a
+  perfectly even spread not expected from a small sample?
+- With `withoutKey: true`, is a record deterministically tied to one partition?
+- Are offsets global to the topic, or specific to each partition?
+- Does the order in one partition establish any relative order with records in
+  another partition?
+
+Kafka guarantees record order within a partition. A multi-partition topic has
+no single global record order.
+
