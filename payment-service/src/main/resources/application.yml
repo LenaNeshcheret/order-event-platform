@@ -11,3 +11,8 @@ spring:
       properties:
         "[spring.json.trusted.packages]": com.olena.events
         "[spring.json.value.default.type]": com.olena.events.OrderCreated
+
+app:
+  kafka:
+    listener:
+      concurrency: ${PAYMENT_LISTENER_CONCURRENCY:1}

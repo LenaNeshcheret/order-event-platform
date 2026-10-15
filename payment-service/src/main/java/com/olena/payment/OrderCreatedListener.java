@@ -23,15 +23,20 @@ class OrderCreatedListener {
         this.serviceInstance = serviceInstance;
     }
 
-    @KafkaListener(topics = "order.created", groupId = "${spring.kafka.consumer.group-id}")
+    @KafkaListener(
+            topics = "order.created",
+            groupId = "${spring.kafka.consumer.group-id}",
+            concurrency = "${app.kafka.listener.concurrency}"
+    )
     void onOrderCreated(ConsumerRecord<String, OrderCreated> record) {
-        log.info("Received OrderCreated: key={}, topic={}, partition={}, offset={}, consumerGroup={}, serviceInstance={}, orderId={}",
+        log.info("Received OrderCreated: key={}, topic={}, partition={}, offset={}, consumerGroup={}, serviceInstance={}, listenerThread={}, orderId={}",
                 record.key(),
                 record.topic(),
                 record.partition(),
                 record.offset(),
                 groupId,
                 serviceInstance,
+                Thread.currentThread().getName(),
                 record.value().payload().orderId());
     }
 }

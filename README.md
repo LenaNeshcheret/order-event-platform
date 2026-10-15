@@ -342,3 +342,123 @@ rather than treating the topic as one globally ordered stream.
 Kafka guarantees record order within a partition. A multi-partition topic has
 no single global record order.
 
+## Lab 03 — Consumer groups, concurrency, and rebalancing
+
+`payment-service` remains in the `payment-service` consumer group. Its listener
+concurrency is now explicit and configurable through
+`PAYMENT_LISTENER_CONCURRENCY`, which defaults to `1`. Each consumer log also
+includes its runtime `serviceInstance` and `listenerThread` so a container and
+its listener threads can be distinguished.
+
+After rebuilding with `mvn verify`, use these commands to recreate only the
+payment consumers. The `order.created` topic still has three partitions, so no
+consumer group can process more than three partitions in parallel.
+
+### One service instance
+
+```bash
+PAYMENT_LISTENER_CONCURRENCY=1 \
+  docker compose up --build --detach --force-recreate --scale payment-service=1 payment-service
+
+docker compose logs --follow payment-service
+```
+
+Publish a batch of distinct keys using the Lab 02 many-key command, then inspect
+the group assignment:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 --describe --group payment-service
+```
+
+One consumer instance owns all three partitions.
+
+### Two, three, and four service instances in the same group
+
+Keep listener concurrency at one per instance, then scale the service. Repeat
+the many-key batch after each command and compare the logs and group assignment.
+
+```bash
+PAYMENT_LISTENER_CONCURRENCY=1 \
+  docker compose up --detach --force-recreate --scale payment-service=2 payment-service
+
+PAYMENT_LISTENER_CONCURRENCY=1 \
+  docker compose up --detach --force-recreate --scale payment-service=3 payment-service
+
+PAYMENT_LISTENER_CONCURRENCY=1 \
+  docker compose up --detach --force-recreate --scale payment-service=4 payment-service
+```
+
+With three partitions, at most three consumers in the group receive partition
+assignments. With four service instances, one is idle. Inspect members and their
+assignments explicitly:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 --describe --group payment-service --members --verbose
+```
+
+### Listener concurrency within one service instance
+
+This is a separate way to create consumers in the same group. Run one container
+with three listener threads, publish distinct keys, and compare
+`listenerThread` values in its logs:
+
+```bash
+PAYMENT_LISTENER_CONCURRENCY=3 \
+  docker compose up --detach --force-recreate --scale payment-service=1 payment-service
+
+docker compose logs --follow payment-service
+```
+
+The concurrency ceiling is still the three topic partitions. Increasing it to
+four does not make a fourth partition available.
+
+### Rebalance experiment
+
+Start three payment-service instances, publish a larger many-key batch, then
+identify one container and kill it while records are being consumed:
+
+```bash
+docker compose ps payment-service
+docker kill <one-payment-service-container-id>
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 --describe --group payment-service --members --verbose
+```
+
+The remaining members receive new partition assignments after the rebalance.
+Start the missing instance again with the three-instance scale command above and
+observe another rebalance.
+
+### Independent consumer group
+
+In a second terminal, start one temporary consumer with a different group ID:
+
+```bash
+docker compose run --rm \
+  --name payment-service-observer \
+  -e SPRING_KAFKA_CONSUMER_GROUP_ID=payment-service-observer \
+  -e SERVICE_INSTANCE_ID=payment-service-observer \
+  payment-service
+```
+
+Publish another batch while this command is running. Both `payment-service` and
+`payment-service-observer` receive the records because each group maintains its
+own partition assignments and offsets. Stop the temporary observer with
+`Ctrl-C` when finished.
+
+### What to inspect after Lab 03
+
+- Does each partition have at most one assigned consumer within one group?
+- How do assignments change from one to two and then three instances?
+- Why is one of four instances idle for a three-partition topic?
+- How do `serviceInstance` and `listenerThread` differ when scaling containers
+  versus increasing listener concurrency?
+- What happens to partition ownership immediately after an instance is killed?
+- Why does a consumer in `payment-service-observer` receive records already
+  consumed by the `payment-service` group?
+
+Do not proceed to offset acknowledgement or replay behavior yet; those are Lab
+04 topics.
+
