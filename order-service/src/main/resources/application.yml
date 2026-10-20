@@ -9,3 +9,9 @@ spring:
 
 server:
   port: 8080
+
+logging:
+#  console:
+#    enabled: false
+  file:
+    name: ${LOG_FILE:logs/order-service.log}
