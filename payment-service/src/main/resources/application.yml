@@ -3,6 +3,8 @@ spring:
     name: payment-service
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    listener:
+      ack-mode: ${PAYMENT_ACK_MODE:BATCH}
     consumer:
       group-id: payment-service
       auto-offset-reset: earliest
@@ -16,3 +18,9 @@ app:
   kafka:
     listener:
       concurrency: ${PAYMENT_LISTENER_CONCURRENCY:1}
+      processing-delay-ms: ${PAYMENT_PROCESSING_DELAY_MS:0}
+      failure-order-id: ${PAYMENT_FAILURE_ORDER_ID:disabled}
+
+logging:
+  file:
+    name: ${LOG_FILE:logs/payment-service.log}

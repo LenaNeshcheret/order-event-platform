@@ -182,6 +182,14 @@ key, topic, partition, offset, consumer group, and service instance.
 docker compose logs --follow order-service payment-service
 ```
 
+Both services also write to files on the host, which persist while the Compose
+environment is running:
+
+```bash
+tail -f logs/order-service/order-service.log \
+  logs/payment-service/payment-service.log
+```
+
 List and describe the topic from the Kafka CLI inside the broker container:
 
 ```bash
@@ -458,6 +466,143 @@ own partition assignments and offsets. Stop the temporary observer with
 - What happens to partition ownership immediately after an instance is killed?
 - Why does a consumer in `payment-service-observer` receive records already
   consumed by the `payment-service` group?
+
+## Lab 04 — Offsets and acknowledgement modes
+
+Lab 04 makes the payment listener's acknowledgement behavior explicit while
+keeping the default path close to Spring Kafka's normal batch acknowledgement.
+There are no custom retries, DLTs, transactions, or idempotency logic in this
+lab.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `PAYMENT_ACK_MODE` | `BATCH` | Spring Kafka acknowledgement mode; use `MANUAL_IMMEDIATE` for the manual experiment. |
+| `PAYMENT_PROCESSING_DELAY_MS` | `0` | Delays processing before a manual acknowledgement, creating time to stop the consumer. |
+| `PAYMENT_FAILURE_ORDER_ID` | `disabled` | Throws before acknowledgement only when the payload order ID exactly matches this value. |
+
+Before each experiment, use a single payment-service instance so group changes
+do not obscure acknowledgement behavior:
+
+```bash
+PAYMENT_LISTENER_CONCURRENCY=1 \
+  docker compose up --build --detach --force-recreate --scale payment-service=1 payment-service
+```
+
+### Observe normal batch acknowledgement
+
+Use the default `BATCH` mode, produce a Lab 02 batch, and compare the
+consumer's current and committed offsets after it processes the records:
+
+```bash
+PAYMENT_ACK_MODE=BATCH \
+  docker compose up --detach --force-recreate --scale payment-service=1 payment-service
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 --describe --group payment-service
+```
+
+In this mode the listener does not call `Acknowledgment` itself. The container
+commits eligible processed records when it completes the poll batch.
+
+### Observe manual acknowledgement and redelivery
+
+Run with manual-immediate acknowledgement and a 30-second delay. The manual
+acknowledgement happens only after that delay:
+
+```bash
+PAYMENT_ACK_MODE=MANUAL_IMMEDIATE PAYMENT_PROCESSING_DELAY_MS=30000 \
+  docker compose up --detach --force-recreate --scale payment-service=1 payment-service
+
+docker compose logs --follow payment-service
+```
+
+While the log shows `Delaying processing`, publish one record with a distinctive
+order ID in another terminal:
+
+
+```bash
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab04-redelivery","count":1,"withoutKey":false}'
+```
+
+Kill the payment-service container before it prints `Manually acknowledged`,
+then start it again with the same manual-mode command. The uncommitted record
+is delivered again:
+
+```bash
+docker compose ps payment-service
+docker kill <payment-service-container-id>
+```
+
+### Controlled listener failure before acknowledgement
+
+The following optional experiment makes one matching record throw before its
+manual acknowledgement. It deliberately configures no error handler; bounded
+retry behavior is introduced only in Lab 05.
+
+```bash
+PAYMENT_ACK_MODE=MANUAL_IMMEDIATE PAYMENT_FAILURE_ORDER_ID=lab04-failure \
+  docker compose up --detach --force-recreate --scale payment-service=1 payment-service
+
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab04-failure","count":1,"withoutKey":false}'
+```
+
+Follow the payment-service logs and inspect the group offsets. Restore the
+default `PAYMENT_FAILURE_ORDER_ID=disabled` before further experiments.
+
+### Reset and replay a group
+
+Kafka refuses to reset offsets for an active group, so stop the payment service
+first. Reset the group's `order.created` offsets to the beginning, then start
+the normal BATCH-mode consumer and observe the replay:
+
+```bash
+docker compose stop payment-service
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 \
+  --group payment-service \
+  --topic order.created \
+  --reset-offsets --to-earliest --execute
+
+PAYMENT_ACK_MODE=BATCH \
+  docker compose up --detach --scale payment-service=1 payment-service
+```
+
+### `earliest` versus `latest` for a new group
+
+Start the following command in a separate terminal before producing records.
+The `lab04-latest` group starts at the end of each partition and therefore sees
+only records produced after it begins:
+
+```bash
+docker compose run --rm \
+  --name payment-service-latest \
+  -e SPRING_KAFKA_CONSUMER_GROUP_ID=lab04-latest \
+  -e SPRING_KAFKA_CONSUMER_AUTO_OFFSET_RESET=latest \
+  -e SERVICE_INSTANCE_ID=payment-service-latest \
+  payment-service
+```
+
+Repeat with `lab04-earliest` and `SPRING_KAFKA_CONSUMER_AUTO_OFFSET_RESET=earliest`
+to consume the existing history. Stop each temporary consumer with `Ctrl-C`.
+
+### What to inspect after Lab 04
+
+- For each partition, how do the group's current and committed offsets change
+  after normal BATCH processing?
+- Why does killing the manual-mode consumer during its delay cause the record
+  to reappear after restart?
+- Why must a group be inactive before its offsets are reset?
+- What does replay prove about the difference between a Kafka record and a
+  completed business side effect?
+- How does `auto.offset.reset` affect a group with no committed offsets, and
+  why does it not override existing committed offsets?
+
+Do not add bounded retries or a DLT yet; those belong to Lab 05 and Lab 06.
 
 Do not proceed to offset acknowledgement or replay behavior yet; those are Lab
 04 topics.
