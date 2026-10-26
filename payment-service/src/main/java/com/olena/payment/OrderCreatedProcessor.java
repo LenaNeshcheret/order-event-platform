@@ -5,40 +5,36 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
 
 @Component
-class OrderCreatedListener {
-    private static final Logger log = LoggerFactory.getLogger(OrderCreatedListener.class);
+class OrderCreatedProcessor {
+    private static final Logger log = LoggerFactory.getLogger(OrderCreatedProcessor.class);
 
     private final String groupId;
     private final String serviceInstance;
     private final String acknowledgementMode;
     private final long processingDelayMs;
     private final String failureOrderId;
+    private final long failureOffset;
 
-    OrderCreatedListener(
+    OrderCreatedProcessor(
             @Value("${spring.kafka.consumer.group-id}") String groupId,
             @Value("${SERVICE_INSTANCE_ID:${HOSTNAME:payment-service}}") String serviceInstance,
             @Value("${spring.kafka.listener.ack-mode}") String acknowledgementMode,
             @Value("${app.kafka.listener.processing-delay-ms}") long processingDelayMs,
-            @Value("${app.kafka.listener.failure-order-id}") String failureOrderId
+            @Value("${app.kafka.listener.failure-order-id}") String failureOrderId,
+            @Value("${app.kafka.listener.failure-offset}") long failureOffset
     ) {
         this.groupId = groupId;
         this.serviceInstance = serviceInstance;
         this.acknowledgementMode = acknowledgementMode;
         this.processingDelayMs = processingDelayMs;
         this.failureOrderId = failureOrderId;
+        this.failureOffset = failureOffset;
     }
 
-    @KafkaListener(
-            topics = "order.created",
-            groupId = "${spring.kafka.consumer.group-id}",
-            concurrency = "${app.kafka.listener.concurrency}"
-    )
-    void onOrderCreated(ConsumerRecord<String, OrderCreated> record, Acknowledgment acknowledgment) {
+    void process(ConsumerRecord<String, OrderCreated> record) {
         log.info("Processing OrderCreated: key={}, topic={}, partition={}, offset={}, consumerGroup={}, serviceInstance={}, listenerThread={}, acknowledgementMode={}, orderId={}",
                 record.key(),
                 record.topic(),
@@ -52,18 +48,11 @@ class OrderCreatedListener {
 
         delayProcessing();
 
-        if (record.value().payload().orderId().equals(failureOrderId)) {
-            log.warn("Failing before acknowledgement for orderId={}", failureOrderId);
-            throw new IllegalStateException("Lab 04 failure before acknowledgement for orderId=" + failureOrderId);
+        if (record.offset() == failureOffset) {
+            throw new IllegalStateException("Lab 04 failure before acknowledgement for offset=" + failureOffset);
         }
-
-        if (usesManualAcknowledgement()) {
-            if (acknowledgment == null) {
-                throw new IllegalStateException("Manual acknowledgement mode requires an Acknowledgment");
-            }
-            acknowledgment.acknowledge();
-            log.info("Manually acknowledged OrderCreated: topic={}, partition={}, offset={}, consumerGroup={}, serviceInstance={}",
-                    record.topic(), record.partition(), record.offset(), groupId, serviceInstance);
+        if (record.value().payload().orderId().equals(failureOrderId)) {
+            throw new IllegalStateException("Lab 04 failure before acknowledgement for orderId=" + failureOrderId);
         }
     }
 
@@ -82,8 +71,4 @@ class OrderCreatedListener {
         }
     }
 
-    private boolean usesManualAcknowledgement() {
-        return "MANUAL".equalsIgnoreCase(acknowledgementMode)
-                || "MANUAL_IMMEDIATE".equalsIgnoreCase(acknowledgementMode);
-    }
 }
