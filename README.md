@@ -671,3 +671,97 @@ Run two short automatic `BATCH` experiments with otherwise identical settings:
 
 Do not add bounded retries, DLTs, transactions, or idempotency yet; those belong to later labs.
 
+## Lab 05 — Failure handling and blocking retries
+
+### Goal
+
+Observe what happens when a listener throws. This lab deliberately uses a
+blocking retry: the failed partition is paused while the same record is retried.
+Records behind it in that partition cannot progress until it succeeds or the
+configured retries are exhausted. Other partitions can still make progress.
+
+### Implementation used by this lab
+
+`PAYMENT_FAILURE_ORDER_ID` is the deterministic poison-record trigger. When
+the payload order ID matches its value, `payment-service` throws before the
+listener returns. A `DefaultErrorHandler` retries the same record with an
+explicit `FixedBackOff`; it logs each failed delivery with the delivery attempt,
+record key, topic, partition, and offset.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `PAYMENT_FAILURE_ORDER_ID` | `disabled` | Exact order ID that should fail on every delivery. |
+| `PAYMENT_RETRY_BACKOFF_MS` | `1000` | Delay between retries of the failed record. |
+| `PAYMENT_RETRY_MAX_RETRIES` | `2` | Retries after the initial delivery; the poison record is delivered three times in total. |
+
+After the two retries are exhausted, the configured recoverer logs that the
+poison record is skipped and allows the partition to continue. It does **not**
+publish to a DLT or retry topic. Those are Lab 06 topics. This is an
+at-least-once listener: do not add side effects to the processor yet.
+
+### Step 1 — Start one automatic consumer
+
+Use a fresh group and automatic `BATCH` acknowledgement so the failure handler
+is the only behavior under study:
+
+```bash
+mvn verify
+docker compose up --build --detach kafka kafbat-ui order-service
+
+PAYMENT_CONSUMER_GROUP_ID=lab05-blocking \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=automatic \
+PAYMENT_ACK_MODE=BATCH \
+PAYMENT_LISTENER_CONCURRENCY=1 \
+PAYMENT_RETRY_BACKOFF_MS=1000 \
+PAYMENT_RETRY_MAX_RETRIES=2 \
+PAYMENT_FAILURE_ORDER_ID=lab05-poison \
+  docker compose up --build --detach --force-recreate payment-service
+
+docker compose logs --follow payment-service
+```
+
+### Step 2 — Produce a poison record followed by a healthy record
+
+Both records use the same key, so they go to one partition in order. Submit the
+poison record first, then the healthy one:
+
+```bash
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab05-poison","count":1,"withoutKey":false}'
+
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab05-after-poison","count":1,"withoutKey":false}'
+```
+
+The log shows three `Listener failure` entries for the poison record with
+increasing `deliveryAttempt` values, approximately one second apart. The
+healthy record in that partition is processed only after `Retries exhausted;
+skipping poison record` appears.
+
+### Step 3 — Compare another partition
+
+While the poison record is retrying, submit records with different order IDs.
+Inspect the producer response or Kafbat UI to choose one assigned to another
+partition. That partition can continue processing while the poison record blocks
+its own partition; Kafka ordering is per partition, not global to the topic.
+
+```bash
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab05-other-key","count":3,"withoutKey":false}'
+```
+
+### What to inspect before Lab 06
+
+1. Why is the poison record delivered three times rather than two?
+2. Why does the healthy record behind it wait, even though it never throws?
+3. Which records can progress while that partition is blocked, and why?
+4. Why does skipping a poison record after retries avoid a permanently stalled partition but risk losing its business effect?
+5. Why is a logged recoverer different from a DLT?
+
+Do not add retry topics or a DLT yet; Lab 06 introduces those patterns and
+their ordering trade-offs.
+

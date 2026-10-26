@@ -49,10 +49,10 @@ class OrderCreatedProcessor {
         delayProcessing();
 
         if (record.offset() == failureOffset) {
-            throw new IllegalStateException("Lab 04 failure before acknowledgement for offset=" + failureOffset);
+            throw new IllegalStateException("Intentional failure for offset=" + failureOffset);
         }
         if (record.value().payload().orderId().equals(failureOrderId)) {
-            throw new IllegalStateException("Lab 04 failure before acknowledgement for orderId=" + failureOrderId);
+            throw new IllegalStateException("Intentional poison record for orderId=" + failureOrderId);
         }
     }
 
