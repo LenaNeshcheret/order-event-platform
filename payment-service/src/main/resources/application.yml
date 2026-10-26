@@ -6,8 +6,9 @@ spring:
     listener:
       ack-mode: ${PAYMENT_ACK_MODE:BATCH}
     consumer:
-      group-id: payment-service
-      auto-offset-reset: earliest
+      group-id: ${PAYMENT_CONSUMER_GROUP_ID:payment-service}
+      auto-offset-reset: ${PAYMENT_AUTO_OFFSET_RESET:earliest}
+      max-poll-records: ${PAYMENT_MAX_POLL_RECORDS:500}
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
       properties:
@@ -18,8 +19,10 @@ app:
   kafka:
     listener:
       concurrency: ${PAYMENT_LISTENER_CONCURRENCY:1}
+      style: ${PAYMENT_LISTENER_STYLE:automatic}
       processing-delay-ms: ${PAYMENT_PROCESSING_DELAY_MS:0}
       failure-order-id: ${PAYMENT_FAILURE_ORDER_ID:disabled}
+      failure-offset: ${PAYMENT_FAILURE_OFFSET:-1}
 
 logging:
   file:

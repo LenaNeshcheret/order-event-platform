@@ -429,7 +429,7 @@ identify one container and kill it while records are being consumed:
 
 ```bash
 docker compose ps payment-service
-docker kill <one-payment-service-container-id>
+docker kill "$(docker compose ps -q payment-service | head -n 1)"
 
 docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   --bootstrap-server kafka:9092 --describe --group payment-service --members --verbose
@@ -469,141 +469,205 @@ own partition assignments and offsets. Stop the temporary observer with
 
 ## Lab 04 — Offsets and acknowledgement modes
 
-Lab 04 makes the payment listener's acknowledgement behavior explicit while
-keeping the default path close to Spring Kafka's normal batch acknowledgement.
-There are no custom retries, DLTs, transactions, or idempotency logic in this
-lab.
+### Goal
+
+See exactly when a consumer group advances its committed offset. Kafka stores the **next** offset to read: committed offset `3` means records `0`, `1`, and `2` are complete, and restart begins at `3`.
+
+### Implementation used by this lab
+
+The service uses two listener variants, selected by `PAYMENT_LISTENER_STYLE`. Exactly one starts.
+
+| Listener style | Valid acknowledgement modes | Listener contract |
+| --- | --- | --- |
+| `automatic` | `BATCH`, `RECORD`, `TIME`, `COUNT`, `COUNT_TIME` | Receives a `ConsumerRecord`; Spring commits after success according to the selected mode. |
+| `manual` | `MANUAL`, `MANUAL_IMMEDIATE` | Receives `ConsumerRecord` and `Acknowledgment`; it calls `acknowledge()` only after success. |
+
+The application fails at startup for an invalid style/mode combination. Manual acknowledgement is a different listener contract, not a toggle an automatic listener can safely ignore.
+
+There is no custom error handler, retry topic, DLT, transaction, or idempotency logic in this lab. Retry and recovery policy belongs to Labs 05 and 06.
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `PAYMENT_ACK_MODE` | `BATCH` | Spring Kafka acknowledgement mode; use `MANUAL_IMMEDIATE` for the manual experiment. |
-| `PAYMENT_PROCESSING_DELAY_MS` | `0` | Delays processing before a manual acknowledgement, creating time to stop the consumer. |
-| `PAYMENT_FAILURE_ORDER_ID` | `disabled` | Throws before acknowledgement only when the payload order ID exactly matches this value. |
+| `PAYMENT_LISTENER_STYLE` | `automatic` | Selects the automatic or manual listener variant. |
+| `PAYMENT_ACK_MODE` | `BATCH` | Spring Kafka acknowledgement mode. |
+| `PAYMENT_CONSUMER_GROUP_ID` | `payment-service7` | Group inspected by this experiment. |
+| `PAYMENT_AUTO_OFFSET_RESET` | `earliest` | Used only when this group has no usable committed offset. |
+| `PAYMENT_MAX_POLL_RECORDS` | `500` | Set to `5` for the five-record manual comparison. |
+| `PAYMENT_PROCESSING_DELAY_MS` | `0` | Delay before acknowledgement; creates an observable crash window. |
+| `PAYMENT_FAILURE_OFFSET` | `-1` | Throws before acknowledgement only for this Kafka offset; `-1` disables it. |
+| `PAYMENT_FAILURE_ORDER_ID` | `disabled` | Alternative failure trigger based on the payload order ID. |
 
-Before each experiment, use a single payment-service instance so group changes
-do not obscure acknowledgement behavior:
+### Modes to learn
+
+| Mode | Commit point after successful processing |
+| --- | --- |
+| `BATCH` | After every record returned by the current `poll()` completes. |
+| `RECORD` | After each listener invocation returns. |
+| `MANUAL` | The listener calls `acknowledge()`, then Spring commits using `BATCH` semantics. |
+| `MANUAL_IMMEDIATE` | Immediately when the listener calls `acknowledge()` on its consumer thread. |
+| `TIME`, `COUNT`, `COUNT_TIME` | Automatic modes that add a time threshold, record-count threshold, or either threshold. Read about them now; defer hands-on experiments until the four modes above are clear. |
+
+`Acknowledgment submitted` in the log does **not** necessarily mean the offset is committed: with `MANUAL`, it is queued until the poll completes. The group description is the source of truth.
+
+### Step 1 — Build and isolate one consumer
 
 ```bash
-PAYMENT_LISTENER_CONCURRENCY=1 \
-  docker compose up --build --detach --force-recreate --scale payment-service=1 payment-service
+mvn verify
+docker compose up --build --detach kafka kafbat-ui order-service
+docker compose stop payment-service
 ```
 
-### Observe normal batch acknowledgement
+Keep `PAYMENT_LISTENER_CONCURRENCY=1` throughout Lab 04. Multiple instances and partition assignment are Lab 03 topics.
+`kafbat-ui` is the Compose service for the browser UI. `kafka-consumer-groups.sh`
+is a Kafka CLI program, executed inside the `kafka` container with
+`docker compose exec kafka ...`; it is not a Compose service.
 
-Use the default `BATCH` mode, produce a Lab 02 batch, and compare the
-consumer's current and committed offsets after it processes the records:
+### Step 2 — Prepare five records in one partition
 
-```bash
-PAYMENT_ACK_MODE=BATCH \
-  docker compose up --detach --force-recreate --scale payment-service=1 payment-service
-
-docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
-  --bootstrap-server kafka:9092 --describe --group payment-service
-```
-
-In this mode the listener does not call `Acknowledgment` itself. The container
-commits eligible processed records when it completes the poll batch.
-
-### Observe manual acknowledgement and redelivery
-
-Run with manual-immediate acknowledgement and a 30-second delay. The manual
-acknowledgement happens only after that delay:
+Before each comparison, set `GROUP` to the group name used by that comparison.
+For example, use `lab04-batch` for Step 3. The group must be inactive before
+Kafka permits a reset.
 
 ```bash
-PAYMENT_ACK_MODE=MANUAL_IMMEDIATE PAYMENT_PROCESSING_DELAY_MS=30000 \
-  docker compose up --detach --force-recreate --scale payment-service=1 payment-service
+GROUP=lab04-batch
 
-docker compose logs --follow payment-service
-```
-
-While the log shows `Delaying processing`, publish one record with a distinctive
-order ID in another terminal:
-
-
-```bash
-curl --request POST http://localhost:8080/orders/experiments \
-  --header 'Content-Type: application/json' \
-  --data '{"orderId":"lab04-redelivery","count":1,"withoutKey":false}'
-```
-
-Kill the payment-service container before it prints `Manually acknowledged`,
-then start it again with the same manual-mode command. The uncommitted record
-is delivered again:
-
-```bash
-docker compose ps payment-service
-docker kill <payment-service-container-id>
-```
-
-### Controlled listener failure before acknowledgement
-
-The following optional experiment makes one matching record throw before its
-manual acknowledgement. It deliberately configures no error handler; bounded
-retry behavior is introduced only in Lab 05.
-
-```bash
-PAYMENT_ACK_MODE=MANUAL_IMMEDIATE PAYMENT_FAILURE_ORDER_ID=lab04-failure \
-  docker compose up --detach --force-recreate --scale payment-service=1 payment-service
-
-curl --request POST http://localhost:8080/orders/experiments \
-  --header 'Content-Type: application/json' \
-  --data '{"orderId":"lab04-failure","count":1,"withoutKey":false}'
-```
-
-Follow the payment-service logs and inspect the group offsets. Restore the
-default `PAYMENT_FAILURE_ORDER_ID=disabled` before further experiments.
-
-### Reset and replay a group
-
-Kafka refuses to reset offsets for an active group, so stop the payment service
-first. Reset the group's `order.created` offsets to the beginning, then start
-the normal BATCH-mode consumer and observe the replay:
-
-```bash
 docker compose stop payment-service
 
 docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   --bootstrap-server kafka:9092 \
-  --group payment-service \
+  --group "$GROUP" \
   --topic order.created \
-  --reset-offsets --to-earliest --execute
-
-PAYMENT_ACK_MODE=BATCH \
-  docker compose up --detach --scale payment-service=1 payment-service
+  --reset-offsets --to-latest --execute
 ```
 
-### `earliest` versus `latest` for a new group
+If a brand-new group does not yet exist, start payment-service once with that group and `PAYMENT_AUTO_OFFSET_RESET=latest`, wait for `partitions assigned`, stop it, then repeat the reset command.
 
-Start the following command in a separate terminal before producing records.
-The `lab04-latest` group starts at the end of each partition and therefore sees
-only records produced after it begins:
+Publish exactly five records while payment-service is stopped. One key keeps all five in one partition. In the response, call the first offset `S`; the fourth record is `S + 3`.
 
 ```bash
-docker compose run --rm \
-  --name payment-service-latest \
-  -e SPRING_KAFKA_CONSUMER_GROUP_ID=lab04-latest \
-  -e SPRING_KAFKA_CONSUMER_AUTO_OFFSET_RESET=latest \
-  -e SERVICE_INSTANCE_ID=payment-service-latest \
-  payment-service
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab04-five","count":5,"withoutKey":false}'
 ```
 
-Repeat with `lab04-earliest` and `SPRING_KAFKA_CONSUMER_AUTO_OFFSET_RESET=earliest`
-to consume the existing history. Stop each temporary consumer with `Ctrl-C`.
+### Step 3 — Compare automatic `BATCH` and `RECORD`
 
-### What to inspect after Lab 04
+Prepare five records using Step 2 with group `lab04-batch`, then run. This
+sets Kafka's `max.poll.records=2` through the Docker Compose environment
+variable `PAYMENT_MAX_POLL_RECORDS=2`:
 
-- For each partition, how do the group's current and committed offsets change
-  after normal BATCH processing?
-- Why does killing the manual-mode consumer during its delay cause the record
-  to reappear after restart?
-- Why must a group be inactive before its offsets are reset?
-- What does replay prove about the difference between a Kafka record and a
-  completed business side effect?
-- How does `auto.offset.reset` affect a group with no committed offsets, and
-  why does it not override existing committed offsets?
+```bash
+PAYMENT_CONSUMER_GROUP_ID=lab04-batch \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=automatic \
+PAYMENT_ACK_MODE=BATCH \
+PAYMENT_LISTENER_CONCURRENCY=1 \
+PAYMENT_MAX_POLL_RECORDS=2 \
+  docker compose up --build --detach --force-recreate payment-service
 
-Do not add bounded retries or a DLT yet; those belong to Lab 05 and Lab 06.
+docker compose logs --follow payment-service
+```
 
-Do not proceed to offset acknowledgement or replay behavior yet; those are Lab
-04 topics.
+After all five records succeed, inspect the committed offsets:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 --describe --group lab04-batch
+```
+
+Repeat with group `lab04-record` and `PAYMENT_ACK_MODE=RECORD`, keeping
+`PAYMENT_MAX_POLL_RECORDS=2`. Both modes commit five successful records.
+`RECORD` can commit after each listener return; `BATCH` waits for the
+complete poll. The next two steps make that boundary visible.
+
+### Step 4 — `MANUAL_IMMEDIATE`: commit the first three records
+
+Prepare five records using Step 2 with group `lab04-manual-immediate`. Set `PAYMENT_MAX_POLL_RECORDS=5` so the five records can be returned by one poll.
+
+```bash
+PAYMENT_CONSUMER_GROUP_ID=lab04-manual-immediate \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=manual \
+PAYMENT_ACK_MODE=MANUAL_IMMEDIATE \
+PAYMENT_MAX_POLL_RECORDS=5 \
+PAYMENT_PROCESSING_DELAY_MS=10000 \
+  docker compose up --build --detach --force-recreate payment-service
+
+docker compose logs --follow payment-service
+```
+
+Wait until `S`, `S + 1`, and `S + 2` log `Acknowledgment submitted`. When `S + 3` logs `Delaying processing`, kill the container before its delay ends:
+
+```bash
+docker compose kill payment-service
+```
+
+Inspect the group. Its committed offset should be `S + 3`, which is the next record to read; the first three are not replayed. Restart with the same group and mode, but `PAYMENT_PROCESSING_DELAY_MS=0`. The first consumed record on that partition should be `S + 3`.
+
+```bash
+PAYMENT_CONSUMER_GROUP_ID=lab04-manual-immediate \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=manual \
+PAYMENT_ACK_MODE=MANUAL_IMMEDIATE \
+PAYMENT_MAX_POLL_RECORDS=5 \
+PAYMENT_PROCESSING_DELAY_MS=0 \
+  docker compose up --build --detach --force-recreate payment-service
+```
+
+### Step 5 — `MANUAL`: queue the first three acknowledgements
+
+Repeat Step 4 with a new group named `lab04-manual`, but set `PAYMENT_ACK_MODE=MANUAL`.
+
+```bash
+PAYMENT_CONSUMER_GROUP_ID=lab04-manual \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=manual \
+PAYMENT_ACK_MODE=MANUAL \
+PAYMENT_MAX_POLL_RECORDS=5 \
+PAYMENT_PROCESSING_DELAY_MS=10000 \
+  docker compose up --build --detach --force-recreate payment-service
+```
+
+Kill the container while `S + 3` is delayed. The first three acknowledgements were submitted, but `MANUAL` uses batch semantics and the five-record poll did not complete. The committed offset should remain `S`.
+
+Restart with delay `0`. The partition starts at `S`, so `S`, `S + 1`, and `S + 2` are delivered again. This intentional duplicate delivery is why later labs introduce idempotency.
+
+### Step 6 — Optional: throw on the fourth record
+
+Repeat the manual-immediate setup, replacing the delay-only crash window with the integer offset of the fourth record. Replace `123` below with `S + 3` from the producer response:
+
+```bash
+PAYMENT_CONSUMER_GROUP_ID=lab04-manual-immediate \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=manual \
+PAYMENT_ACK_MODE=MANUAL_IMMEDIATE \
+PAYMENT_MAX_POLL_RECORDS=5 \
+PAYMENT_PROCESSING_DELAY_MS=0 \
+PAYMENT_FAILURE_OFFSET=123 \
+  docker compose up --build --detach --force-recreate payment-service
+```
+
+The processor throws before acknowledgement at that offset. Kill the container after the first failure, before Spring's default error handling can recover it. Restart with `PAYMENT_FAILURE_OFFSET=-1`. This proves that an exception before acknowledgement leaves the record uncommitted; Lab 05 studies retry and recovery policy.
+
+### Step 7 — `earliest` versus `latest` for a new group
+
+Run two short automatic `BATCH` experiments with otherwise identical settings:
+
+- group `lab04-earliest` with `PAYMENT_AUTO_OFFSET_RESET=earliest` reads retained history;
+- group `lab04-latest` with `PAYMENT_AUTO_OFFSET_RESET=latest` starts at the end and sees only later records.
+
+`auto-offset-reset` applies only when the group has no usable committed offset. It never overrides an existing committed position.
+
+### Questions to answer before Lab 05
+
+1. Why does a committed offset of `S + 3` mean that records through `S + 2` are complete?
+2. Why does `MANUAL_IMMEDIATE` restart at `S + 3`, while `MANUAL` restarts at `S` in the incomplete five-record-poll experiment?
+3. Why is `Acknowledgment submitted` not proof of a durable commit in `MANUAL` mode?
+4. What happens if a business side effect completes but the process dies before the offset commits?
+5. Why must the group be inactive before Kafka resets its offsets?
+6. Why must all five experiment records use one key and therefore one partition?
+7. When does `auto-offset-reset` apply, and why does changing it not replay an already-committed group?
+8. Why are `TIME`, `COUNT`, and `COUNT_TIME` less useful than the four core modes for the first acknowledgement experiment?
+
+Do not add bounded retries, DLTs, transactions, or idempotency yet; those belong to later labs.
 
