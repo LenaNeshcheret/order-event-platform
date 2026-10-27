@@ -3,6 +3,9 @@ spring:
     name: payment-service
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
     listener:
       ack-mode: ${PAYMENT_ACK_MODE:BATCH}
     consumer:
@@ -23,9 +26,10 @@ app:
       processing-delay-ms: ${PAYMENT_PROCESSING_DELAY_MS:0}
       failure-order-id: ${PAYMENT_FAILURE_ORDER_ID:disabled}
       failure-offset: ${PAYMENT_FAILURE_OFFSET:-1}
+      failures-before-success: ${PAYMENT_FAILURES_BEFORE_SUCCESS:-1}
       retry:
         backoff-ms: ${PAYMENT_RETRY_BACKOFF_MS:1000}
-        max-retries: ${PAYMENT_RETRY_MAX_RETRIES:2}
+        attempts: ${PAYMENT_RETRY_ATTEMPTS:3}
 
 logging:
   file:
