@@ -23,6 +23,9 @@ app:
       processing-delay-ms: ${PAYMENT_PROCESSING_DELAY_MS:0}
       failure-order-id: ${PAYMENT_FAILURE_ORDER_ID:disabled}
       failure-offset: ${PAYMENT_FAILURE_OFFSET:-1}
+      retry:
+        backoff-ms: ${PAYMENT_RETRY_BACKOFF_MS:1000}
+        max-retries: ${PAYMENT_RETRY_MAX_RETRIES:2}
 
 logging:
   file:
