@@ -7,6 +7,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
 @Component
 class OrderCreatedProcessor {
     private static final Logger log = LoggerFactory.getLogger(OrderCreatedProcessor.class);
@@ -17,6 +21,8 @@ class OrderCreatedProcessor {
     private final long processingDelayMs;
     private final String failureOrderId;
     private final long failureOffset;
+    private final int failuresBeforeSuccess;
+    private final ConcurrentMap<String, AtomicInteger> failureCounts = new ConcurrentHashMap<>();
 
     OrderCreatedProcessor(
             @Value("${spring.kafka.consumer.group-id}") String groupId,
@@ -24,7 +30,8 @@ class OrderCreatedProcessor {
             @Value("${spring.kafka.listener.ack-mode}") String acknowledgementMode,
             @Value("${app.kafka.listener.processing-delay-ms}") long processingDelayMs,
             @Value("${app.kafka.listener.failure-order-id}") String failureOrderId,
-            @Value("${app.kafka.listener.failure-offset}") long failureOffset
+            @Value("${app.kafka.listener.failure-offset}") long failureOffset,
+            @Value("${app.kafka.listener.failures-before-success}") int failuresBeforeSuccess
     ) {
         this.groupId = groupId;
         this.serviceInstance = serviceInstance;
@@ -32,6 +39,7 @@ class OrderCreatedProcessor {
         this.processingDelayMs = processingDelayMs;
         this.failureOrderId = failureOrderId;
         this.failureOffset = failureOffset;
+        this.failuresBeforeSuccess = failuresBeforeSuccess;
     }
 
     void process(ConsumerRecord<String, OrderCreated> record) {
@@ -51,8 +59,15 @@ class OrderCreatedProcessor {
         if (record.offset() == failureOffset) {
             throw new IllegalStateException("Intentional failure for offset=" + failureOffset);
         }
-        if (record.value().payload().orderId().equals(failureOrderId)) {
-            throw new IllegalStateException("Intentional poison record for orderId=" + failureOrderId);
+        String orderId = record.value().payload().orderId();
+        if (orderId.equals(failureOrderId)) {
+            int failureAttempt = failureCounts
+                    .computeIfAbsent(orderId, ignored -> new AtomicInteger())
+                    .incrementAndGet();
+            if (failuresBeforeSuccess < 0 || failureAttempt <= failuresBeforeSuccess) {
+                throw new IllegalStateException("Intentional failure for orderId=" + orderId
+                        + ", failureAttempt=" + failureAttempt);
+            }
         }
     }
 

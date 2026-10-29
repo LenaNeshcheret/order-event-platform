@@ -765,3 +765,121 @@ curl --request POST http://localhost:8080/orders/experiments \
 Do not add retry topics or a DLT yet; Lab 06 introduces those patterns and
 their ordering trade-offs.
 
+## Lab 06 — Non-blocking retry topics and DLT
+
+### Goal
+
+Compare the Lab 05 blocking retry with a retry-topic flow. A failed record is
+forwarded to a retry topic instead of holding its original partition. The next
+record in the original partition can proceed, but strict ordering for that key
+is no longer preserved across the original and retry topics.
+
+### Implementation used by this lab
+
+The automatic `order.created` listener uses `@RetryableTopic`; this registers
+the retry and DLT topic infrastructure explicitly with three partitions and
+replication factor one. The broker's general auto-topic creation remains
+disabled. The retry path is:
+
+```text
+order.created -> order.created-retry-1000 -> order.created-dlt
+```
+
+`PAYMENT_RETRY_ATTEMPTS=3` means an initial delivery plus two retry-topic
+deliveries. All retry deliveries use the same retry topic and wait one second
+by default. `@DltHandler` logs the DLT record's key, topic, partition, offset,
+payload order ID, original record coordinates, delivery attempt, exception
+message, group, and service instance.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `PAYMENT_FAILURE_ORDER_ID` | `disabled` | Exact order ID selected for the controlled failure. |
+| `PAYMENT_FAILURES_BEFORE_SUCCESS` | `-1` | `-1` fails every matching delivery; `1` fails once and lets the first retry succeed. This in-memory counter resets on service restart. |
+| `PAYMENT_RETRY_ATTEMPTS` | `3` | Initial delivery plus retry-topic deliveries before DLT publication. |
+| `PAYMENT_RETRY_BACKOFF_MS` | `1000` | Delay before each retry-topic delivery. |
+
+The Lab 05 `DefaultErrorHandler` is intentionally replaced rather than
+combined with this flow. There are no container transactions, idempotency
+store, or custom DLT recovery policy in this lab. The DLT handler uses
+`FAIL_ON_ERROR`: if it throws, its DLT record remains for redelivery.
+
+### Step 1 — Start the non-blocking retry consumer
+
+Use automatic acknowledgement only. The manual acknowledgement listener from
+Lab 04 is not the subject of this experiment.
+
+```bash
+mvn verify
+docker compose up --build --detach kafka kafbat-ui order-service
+
+PAYMENT_CONSUMER_GROUP_ID=lab06-retry \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=automatic \
+PAYMENT_ACK_MODE=BATCH \
+PAYMENT_LISTENER_CONCURRENCY=1 \
+PAYMENT_RETRY_ATTEMPTS=3 \
+PAYMENT_RETRY_BACKOFF_MS=1000 \
+PAYMENT_FAILURE_ORDER_ID=lab06-poison \
+PAYMENT_FAILURES_BEFORE_SUCCESS=-1 \
+  docker compose up --build --detach --force-recreate payment-service
+
+docker compose logs --follow payment-service
+```
+
+In Kafbat UI, verify that `order.created-retry-1000` and
+`order.created-dlt` have been created with three partitions. Topic creation is
+performed by `@RetryableTopic` when the listener infrastructure starts.
+
+### Step 2 — Follow a permanent failure to the DLT
+
+Publish the permanently failing record and then a healthy record with the same
+key. The healthy record should be processed before the poison record finishes
+its retry-topic journey.
+
+```bash
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab06-poison","count":1,"withoutKey":true}'
+
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab06-after-poison","count":1,"withoutKey":true}'
+```
+
+Inspect the record in `order.created`, then `order.created-retry-1000`, and
+finally `order.created-dlt`. The payment-service log ends with `DLT record
+received` and includes the original topic, partition, offset, attempt count,
+and exception message.
+
+### Step 3 — Trigger a temporary failure
+
+Restart payment-service with a new group and one controlled failure. The first
+delivery fails; the retry-topic delivery succeeds, so no DLT record is made.
+
+```bash
+PAYMENT_CONSUMER_GROUP_ID=lab06-temporary \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=automatic \
+PAYMENT_ACK_MODE=BATCH \
+PAYMENT_RETRY_ATTEMPTS=3 \
+PAYMENT_RETRY_BACKOFF_MS=1000 \
+PAYMENT_FAILURE_ORDER_ID=lab06-temporary \
+PAYMENT_FAILURES_BEFORE_SUCCESS=1 \
+  docker compose up --build --detach --force-recreate payment-service
+
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab06-temporary","count":1,"withoutKey":false}'
+```
+
+### Questions to answer before Lab 07
+
+1. Why does the healthy record behind a failed record progress sooner here than in Lab 05?
+2. Why can the retry-topic flow break strict ordering for one order key?
+3. Which metadata lets the DLT handler identify the original failed record?
+4. Why must a DLT handler be observable even when it has no recovery action?
+5. Why is a temporary retry success still not proof of idempotent business processing?
+
+Do not add idempotency or another DLT recovery policy yet; Lab 07 introduces
+duplicate delivery and idempotent consumers.
+
