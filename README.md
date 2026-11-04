@@ -883,3 +883,120 @@ curl --request POST http://localhost:8080/orders/experiments \
 Do not add idempotency or another DLT recovery policy yet; Lab 07 introduces
 duplicate delivery and idempotent consumers.
 
+## Lab 07 — Duplicate delivery and idempotency
+
+### Goal
+
+See that Kafka can redeliver an already successful record and that Kafka's
+committed offset does not make a business side effect idempotent. This lab uses
+an intentionally temporary in-memory `eventId` store and a simulated payment
+side-effect counter.
+
+### Implementation used by this lab
+
+After the controlled failure checks complete, `payment-service` applies a
+simulated payment side effect and logs its monotonically increasing count.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `PAYMENT_IDEMPOTENCY_ENABLED` | `false` | `false` applies the side effect for every delivery; `true` applies it only for the first in-memory observation of an `eventId`. |
+| `PAYMENT_FAILURE_AFTER_SIDE_EFFECT_ORDER_ID` | `disabled` | Exact order ID that throws only after the simulated side effect. It deliberately creates redelivery after an effect has occurred. |
+
+When idempotency is enabled, `InMemoryProcessedEventStore` uses the event's
+`eventId` as its key. A replayed event logs `Duplicate OrderCreated ignored`;
+the side-effect counter does not increase. The store and counter both disappear
+when payment-service restarts. This demonstrates the idea only: it does not
+make a real external payment, a process crash, or multiple service instances
+safe.
+
+### Step 1 — Force duplicate effects without idempotency
+
+Use a dedicated group and disable idempotency. The selected record applies its
+side effect, then deliberately throws. The non-blocking retry flow delivers the
+same event again in the still-running process, so its in-memory counter remains
+visible:
+
+```bash
+mvn verify
+docker compose up --build --detach kafka kafbat-ui order-service
+
+PAYMENT_CONSUMER_GROUP_ID=lab07-non-idempotent \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=automatic \
+PAYMENT_ACK_MODE=BATCH \
+PAYMENT_IDEMPOTENCY_ENABLED=false \
+PAYMENT_FAILURE_ORDER_ID=disabled \
+PAYMENT_FAILURE_AFTER_SIDE_EFFECT_ORDER_ID=lab07-duplicate \
+  docker compose up --build --detach --force-recreate payment-service
+```
+
+Publish one record. With the default three attempts, the same `eventId` produces
+three `Simulated payment side effect applied` log entries and increments the
+counter three times before the record reaches the DLT.
+
+```bash
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab07-duplicate","count":1,"withoutKey":false}'
+```
+
+### Step 2 — Repeat with in-memory idempotency enabled
+
+Start with a new group and enable idempotency. The first delivery applies its
+effect and throws. The retry delivery has the same `eventId`, so it logs
+`Duplicate OrderCreated ignored`, does not increment the counter, and returns
+successfully. It never reaches the DLT.
+
+```bash
+PAYMENT_CONSUMER_GROUP_ID=lab07-idempotent \
+PAYMENT_AUTO_OFFSET_RESET=latest \
+PAYMENT_LISTENER_STYLE=automatic \
+PAYMENT_ACK_MODE=BATCH \
+PAYMENT_IDEMPOTENCY_ENABLED=true \
+PAYMENT_FAILURE_ORDER_ID=disabled \
+PAYMENT_FAILURE_AFTER_SIDE_EFFECT_ORDER_ID=lab07-idempotent \
+  docker compose up --build --detach --force-recreate payment-service
+
+curl --request POST http://localhost:8080/orders/experiments \
+  --header 'Content-Type: application/json' \
+  --data '{"orderId":"lab07-idempotent","count":1,"withoutKey":false}'
+```
+
+### Step 3 — Reset offsets and replay
+
+The prior steps demonstrate redelivery while the process is alive. Now replay
+an already successful event through the same group. Stop `payment-service`,
+then reset the exact partition and offset returned by the experiment endpoint.
+Replace `2` and `15` below with the record's actual partition and offset:
+
+```bash
+docker compose stop payment-service
+
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:9092 \
+  --group lab07-idempotent \
+  --topic order.created:2 \
+  --reset-offsets --to-offset 15 --execute
+```
+
+Restart payment-service using the Step 2 command. The same Kafka event is
+delivered again, but its in-memory event-ID store was lost with the restart.
+The simulated side effect is applied again.
+
+### Step 4 — Explain the limitation
+
+A production idempotency key needs durable, shared storage and a carefully
+designed relationship to the side effect. The simple in-memory store also
+cannot coordinate separate service instances.
+
+### Questions to answer before Lab 08
+
+1. Why can the same Kafka record legitimately be delivered more than once?
+2. Why is a Kafka offset not an idempotency key?
+3. Why does the counter increase after replay when idempotency is disabled?
+4. Why does an in-memory event-ID store fail after restart or with multiple instances?
+5. Why can an idempotency store alone still not atomically protect an arbitrary external side effect?
+
+Do not add database storage, transactions, or Kafka-produced payment results
+yet; those belong to later labs.
+

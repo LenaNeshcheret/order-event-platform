@@ -26,7 +26,9 @@ app:
       processing-delay-ms: ${PAYMENT_PROCESSING_DELAY_MS:0}
       failure-order-id: ${PAYMENT_FAILURE_ORDER_ID:disabled}
       failure-offset: ${PAYMENT_FAILURE_OFFSET:-1}
+      failure-after-side-effect-order-id: ${PAYMENT_FAILURE_AFTER_SIDE_EFFECT_ORDER_ID:disabled}
       failures-before-success: ${PAYMENT_FAILURES_BEFORE_SUCCESS:-1}
+      idempotency-enabled: ${PAYMENT_IDEMPOTENCY_ENABLED:false}
       retry:
         backoff-ms: ${PAYMENT_RETRY_BACKOFF_MS:1000}
         attempts: ${PAYMENT_RETRY_ATTEMPTS:3}

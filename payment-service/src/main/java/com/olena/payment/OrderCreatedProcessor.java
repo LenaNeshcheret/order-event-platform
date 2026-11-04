@@ -21,7 +21,11 @@ class OrderCreatedProcessor {
     private final long processingDelayMs;
     private final String failureOrderId;
     private final long failureOffset;
+    private final String failureAfterSideEffectOrderId;
     private final int failuresBeforeSuccess;
+    private final boolean idempotencyEnabled;
+    private final InMemoryProcessedEventStore processedEventStore;
+    private final PaymentSideEffectCounter sideEffectCounter;
     private final ConcurrentMap<String, AtomicInteger> failureCounts = new ConcurrentHashMap<>();
 
     OrderCreatedProcessor(
@@ -31,7 +35,11 @@ class OrderCreatedProcessor {
             @Value("${app.kafka.listener.processing-delay-ms}") long processingDelayMs,
             @Value("${app.kafka.listener.failure-order-id}") String failureOrderId,
             @Value("${app.kafka.listener.failure-offset}") long failureOffset,
-            @Value("${app.kafka.listener.failures-before-success}") int failuresBeforeSuccess
+            @Value("${app.kafka.listener.failure-after-side-effect-order-id}") String failureAfterSideEffectOrderId,
+            @Value("${app.kafka.listener.failures-before-success}") int failuresBeforeSuccess,
+            @Value("${app.kafka.listener.idempotency-enabled}") boolean idempotencyEnabled,
+            InMemoryProcessedEventStore processedEventStore,
+            PaymentSideEffectCounter sideEffectCounter
     ) {
         this.groupId = groupId;
         this.serviceInstance = serviceInstance;
@@ -39,7 +47,11 @@ class OrderCreatedProcessor {
         this.processingDelayMs = processingDelayMs;
         this.failureOrderId = failureOrderId;
         this.failureOffset = failureOffset;
+        this.failureAfterSideEffectOrderId = failureAfterSideEffectOrderId;
         this.failuresBeforeSuccess = failuresBeforeSuccess;
+        this.idempotencyEnabled = idempotencyEnabled;
+        this.processedEventStore = processedEventStore;
+        this.sideEffectCounter = sideEffectCounter;
     }
 
     void process(ConsumerRecord<String, OrderCreated> record) {
@@ -68,6 +80,36 @@ class OrderCreatedProcessor {
                 throw new IllegalStateException("Intentional failure for orderId=" + orderId
                         + ", failureAttempt=" + failureAttempt);
             }
+        }
+
+        if (idempotencyEnabled && !processedEventStore.markProcessedIfFirstDelivery(record.value().eventId())) {
+            log.warn("Duplicate OrderCreated ignored: eventId={}, key={}, topic={}, partition={}, offset={}, consumerGroup={}, serviceInstance={}, sideEffectCount={}",
+                    record.value().eventId(),
+                    record.key(),
+                    record.topic(),
+                    record.partition(),
+                    record.offset(),
+                    groupId,
+                    serviceInstance,
+                    sideEffectCounter.currentCount());
+            return;
+        }
+
+        long sideEffectCount = sideEffectCounter.recordEffect();
+        log.info("Simulated payment side effect applied: eventId={}, orderId={}, key={}, topic={}, partition={}, offset={}, consumerGroup={}, serviceInstance={}, sideEffectCount={}, idempotencyEnabled={}",
+                record.value().eventId(),
+                orderId,
+                record.key(),
+                record.topic(),
+                record.partition(),
+                record.offset(),
+                groupId,
+                serviceInstance,
+                sideEffectCount,
+                idempotencyEnabled);
+
+        if (orderId.equals(failureAfterSideEffectOrderId)) {
+            throw new IllegalStateException("Intentional failure after simulated side effect for orderId=" + orderId);
         }
     }
 
